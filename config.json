@@ -1,0 +1,23 @@
+{
+  "01. enabled": true,
+  "02. provider": "auto",
+  "03. provider_auto_order": [
+    "openai",
+    "gemini"
+  ],
+  "10. openai_api_key": "",
+  "11. openai_model": "gpt-4o-mini",
+  "12. openai_api_url": "https://api.openai.com/v1/responses",
+  "20. gemini_api_key": "",
+  "21. gemini_model": "gemini-2.5-flash-lite",
+  "22. gemini_api_url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+  "30. answer_field": "Back",
+  "31. easy_min": 80,
+  "32. good_min": 60,
+  "33. hard_min": 40,
+  "40. show_tooltip": true,
+  "41. show_on_card": true,
+  "50. auto_answer": true,
+  "60. timeout_sec": 20,
+  "61. max_output_tokens": 16
+}

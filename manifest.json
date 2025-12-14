@@ -1,0 +1,11 @@
+{
+  "package": "ai_type_grader",
+  "name": "AI Type Grader",
+  "mod": 1765542874,
+  "version": "1.2.0",
+  "author": "Yuwa Yanagitani",
+  "homepage": "https://ankiweb.net/shared/info/0000000000",
+  "min_point_version": 250900,
+  "max_point_version": 260000,
+  "description": "Automatically grades typed answers using OpenAI, Gemini, or local similarity scoring, and (optionally) chooses the default ease (Again/Hard/Good/Easy) automatically. Supports numbered config keys like '01. enabled' to keep ordering stable."
+}
