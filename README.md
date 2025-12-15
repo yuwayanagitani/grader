@@ -1,54 +1,45 @@
-# AI Grader for Anki
+# Anki AI Grader
+
+AnkiWeb: https://ankiweb.net/shared/by-author/2117859718
 
 An add-on that scores typed-answer cards (e.g., “Type in the Answer”) using AI or a local fallback, then shows the result as a badge and/or tooltip.
 
 ## Features
-- Use AI to evaluate typed answers against the expected response.
-- Visual feedback (badge/tooltip) showing score and optional short feedback.
-- Configurable scoring thresholds and display options.
-- Local fallback option if you prefer not to use cloud AI.
+- AI or local string-similarity grading of typed answers
+- Shows score/badge inline during review
+- Configurable scoring thresholds and feedback templates
+- Option to write score into a custom field
 
 ## Requirements
-- Anki 2.1+
-- For AI scoring: API key for supported provider (OpenAI/Gemini) or configure local model/fallback.
+- Optional AI provider API key for advanced grading
+- Local fallback uses fuzzy matching (no external calls)
 
 ## Installation
-1. Clone or download the repository.
-2. Place the add-on folder into Anki’s add-ons folder (Tools → Add-ons → Open Add-ons Folder).
+1. Tools → Add-ons → Open Add-ons Folder.
+2. Put the add-on directory under `addons21/`.
 3. Restart Anki.
 
-## Configuration
-- Set provider and credentials (if using cloud AI).
-- Choose scoring granularity, threshold for pass/fail, and feedback verbosity.
-- Optionally enable local/simple heuristic fallback (e.g., edit distance).
+## Usage
+- Configure fields and model in Tools → AI Grader → Settings.
+- Enable grading for selected note types or fields.
 
-Example config:
+## Configuration
+`config.json`:
+- provider (ai/local)
+- feedback_template
+- score_field (optional)
+
+Example:
 ```json
 {
-  "provider": "openai",
-  "api_key_env_var": "OPENAI_API_KEY",
-  "show_badge": true,
-  "threshold": 0.75
+  "provider": "local",
+  "score_field": "GraderScore",
+  "thresholds": { "pass": 0.8 }
 }
 ```
 
-## Usage
-- Works on typed-answer cards; when a user submits an answer the add-on evaluates and displays the score.
-- Scores can be logged or shown as tooltips/badges on the card.
-
-## Privacy & Costs
-- If using cloud AI, prompts and answers may be sent to the provider. Be mindful of privacy and costs.
-- Prefer local fallback for sensitive content.
-
-## Troubleshooting
-- If scoring fails, check network, API key, and Anki console for errors.
-- If you see unexpected scores, tweak prompt templates and scoring thresholds.
-
-## Development
-- PRs and issues welcome. When reporting problems, include Anki version, OS, and sample card setup.
+## Issues & Support
+When reporting problems include the note type, sample question/answers, and Anki version.
 
 ## License
-MIT License — see LICENSE file.
-
-## Contact
-Author: yuwayanagitani
+See LICENSE.
