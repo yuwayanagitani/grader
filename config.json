@@ -19,5 +19,8 @@
   "41. show_on_card": true,
   "50. auto_answer": true,
   "60. timeout_sec": 20,
-  "61. max_output_tokens": 16
+  "61. max_output_tokens": 64,
+  "42. show_feedback_on_card": false,
+  "62. max_question_chars": 1200,
+  "63. feedback_max_chars": 180
 }

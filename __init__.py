@@ -32,11 +32,11 @@ from aqt.qt import (
     QSizePolicy,
 )
 
-
-
 # =============================================================================
 # AI Type Grader (OpenAI + Gemini + Local)
 # - Grades typed answers (0-100) via OpenAI Responses API or Gemini generateContent
+# - Returns score + short feedback (1 sentence) to improve learning
+# - Uses Question text as additional context for stricter grading
 # - Falls back to local similarity scoring on any error
 # - Shows a badge on card back + tooltip
 # - Optionally overrides Enter/Space default ease based on the score
@@ -50,6 +50,9 @@ from aqt.qt import (
 
 # Last AI-recommended ease (1-4)
 last_ai_ease: Optional[int] = None
+
+# Last feedback (optional)
+last_ai_feedback: Optional[str] = None
 
 # Config cache
 _config_cache: Optional[Dict[str, Any]] = None
@@ -90,7 +93,6 @@ def get_config() -> Dict[str, Any]:
 
     cfg_raw = mw.addonManager.getConfig(__name__) or {}
 
-    # --- Key aliases (numbered -> plain) ---
     enabled = bool(_cfg_get(cfg_raw, ["01. enabled", "enabled"], True))
 
     provider = str(_cfg_get(cfg_raw, ["02. provider", "provider"], "") or "").strip().lower()
@@ -104,7 +106,6 @@ def get_config() -> Dict[str, Any]:
     if not auto_order:
         auto_order = ["openai", "gemini"]
 
-    # OpenAI keys (backward-compat: "api_key")
     openai_key = str(_cfg_get(cfg_raw, ["10. openai_api_key", "openai_api_key", "api_key"], "") or "")
     openai_model = str(_cfg_get(cfg_raw, ["11. openai_model", "openai_model"], "gpt-4o-mini") or "gpt-4o-mini")
     openai_api_url = str(
@@ -112,7 +113,6 @@ def get_config() -> Dict[str, Any]:
         or "https://api.openai.com/v1/responses"
     )
 
-    # Gemini keys
     gemini_key = str(_cfg_get(cfg_raw, ["20. gemini_api_key", "gemini_api_key"], "") or "")
     gemini_model = str(_cfg_get(cfg_raw, ["21. gemini_model", "gemini_model"], "gemini-2.5-flash-lite") or "gemini-2.5-flash-lite")
     gemini_api_url = str(
@@ -124,26 +124,24 @@ def get_config() -> Dict[str, Any]:
         or "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     )
 
-    # Answer field
     answer_field = str(_cfg_get(cfg_raw, ["30. answer_field", "answer_field"], "Back") or "Back")
 
-    # Thresholds
     easy_min = int(_cfg_get(cfg_raw, ["31. easy_min", "easy_min"], 80))
     good_min = int(_cfg_get(cfg_raw, ["32. good_min", "good_min"], 60))
     hard_min = int(_cfg_get(cfg_raw, ["33. hard_min", "hard_min"], 40))
 
-    # UI
     show_tooltip = bool(_cfg_get(cfg_raw, ["40. show_tooltip", "show_tooltip"], True))
     show_on_card = bool(_cfg_get(cfg_raw, ["41. show_on_card", "show_on_card"], True))
+    show_feedback_on_card = bool(_cfg_get(cfg_raw, ["42. show_feedback_on_card", "show_feedback_on_card"], False))
 
-    # Behavior
     auto_answer = bool(_cfg_get(cfg_raw, ["50. auto_answer", "auto_answer"], True))
 
-    # Networking
     timeout_sec = int(_cfg_get(cfg_raw, ["60. timeout_sec", "timeout_sec"], 20))
-    max_output_tokens = int(_cfg_get(cfg_raw, ["61. max_output_tokens", "max_output_tokens"], 16))
+    max_output_tokens = int(_cfg_get(cfg_raw, ["61. max_output_tokens", "max_output_tokens"], 64))
 
-    # Default provider if not specified:
+    max_question_chars = int(_cfg_get(cfg_raw, ["62. max_question_chars", "max_question_chars"], 1200))
+    feedback_max_chars = int(_cfg_get(cfg_raw, ["63. feedback_max_chars", "feedback_max_chars"], 180))
+
     if provider == "":
         provider = "openai" if (openai_key or os.getenv("OPENAI_API_KEY", "")) else "auto"
 
@@ -153,37 +151,34 @@ def get_config() -> Dict[str, Any]:
         "provider": provider,
         "provider_auto_order": auto_order,
 
-        # OpenAI
         "openai_api_key": openai_key,
         "openai_model": openai_model,
         "openai_api_url": openai_api_url,
 
-        # Gemini
         "gemini_api_key": gemini_key,
         "gemini_model": gemini_model,
         "gemini_api_url": gemini_api_url,
 
-        # Scoring
         "answer_field": answer_field,
         "easy_min": easy_min,
         "good_min": good_min,
         "hard_min": hard_min,
 
-        # UI
         "show_tooltip": show_tooltip,
         "show_on_card": show_on_card,
+        "show_feedback_on_card": show_feedback_on_card,
 
-        # Behavior
         "auto_answer": auto_answer,
 
-        # Networking
         "timeout_sec": timeout_sec,
         "max_output_tokens": max_output_tokens,
+
+        "max_question_chars": max_question_chars,
+        "feedback_max_chars": feedback_max_chars,
     }
     return _config_cache
 
 
-# Clear cache when config is updated in Add-ons UI (supported in modern Anki)
 try:
     mw.addonManager.setConfigUpdatedAction(__name__, _invalidate_config_cache)  # type: ignore[attr-defined]
 except Exception:
@@ -214,11 +209,57 @@ def normalize_text(s: str) -> str:
     return s
 
 
+def _clip(s: str, n: int) -> str:
+    if n <= 0:
+        return ""
+    if len(s) <= n:
+        return s
+    return s[:n] + "…"
+
+
+# =============================================================================
+# Parsing: score + feedback
+# =============================================================================
+
+_RE_SCORE = re.compile(r"(?im)^\s*score\s*:\s*(\d{1,3})\s*$")
+_RE_FEEDBACK = re.compile(r"(?im)^\s*feedback\s*:\s*(.+?)\s*$")
+
+
+def parse_score_feedback(text: str) -> Tuple[int, str]:
+    t = (text or "").strip()
+
+    score: Optional[int] = None
+    fb: str = ""
+
+    m = _RE_SCORE.search(t)
+    if m:
+        score = int(m.group(1))
+
+    m2 = _RE_FEEDBACK.search(t)
+    if m2:
+        fb = (m2.group(1) or "").strip()
+
+    if score is None:
+        mi = re.search(r"\d+", t)
+        score = int(mi.group()) if mi else 0
+
+    score = max(0, min(100, score))
+
+    if not fb:
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if not ln.lower().startswith("score:")]
+        lines = [ln for ln in lines if not ln.lower().startswith("feedback:")]
+        fb = lines[0] if lines else ""
+
+    return score, fb.strip()
+
+
 # =============================================================================
 # Grading (OpenAI HTTP + Gemini HTTP + Local fallback)
 # =============================================================================
 
 def grade_answer_openai_http(
+    question: str,
     user: str,
     correct: str,
     api_key: str,
@@ -226,20 +267,24 @@ def grade_answer_openai_http(
     api_url: str,
     timeout_sec: int,
     max_output_tokens: int,
-) -> int:
+) -> Tuple[int, str]:
     key = api_key or os.getenv("OPENAI_API_KEY", "")
     if not key:
         raise RuntimeError("OpenAI API key is not set (openai_api_key / api_key / OPENAI_API_KEY).")
 
     prompt = (
-        "Rate how similar the student answer is to the model answer.\n"
-        "Return a number 0-100 only.\n\n"
-        f"Model: {correct}\n"
-        f"Student: {user}\n"
+        "You are grading a student's typed answer in Anki.\n"
+        "Use the QUESTION to judge whether the student's answer satisfies what is asked.\n"
+        "Be strict about constraints (e.g., negation, numbers of items, specific terms).\n"
+        "Return exactly two lines:\n"
+        "Score: <0-100>\n"
+        "Feedback: <one short sentence about the main difference>\n\n"
+        f"Question: {question}\n"
+        f"Model Answer: {correct}\n"
+        f"Student Answer: {user}\n"
     )
 
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
     body = {"model": model, "input": prompt, "max_output_tokens": max_output_tokens, "temperature": 0}
 
     data = json.dumps(body).encode("utf-8")
@@ -262,7 +307,6 @@ def grade_answer_openai_http(
     text: Optional[str] = None
     try:
         out0 = j["output"][0]
-
         ot = out0.get("output_text")
         if isinstance(ot, dict):
             content = ot.get("content")
@@ -296,7 +340,6 @@ def grade_answer_openai_http(
                         if got:
                             return got
                 return None
-
             text = _walk(j)
 
         if text is None:
@@ -305,16 +348,11 @@ def grade_answer_openai_http(
     except Exception as e:
         raise RuntimeError(f"OpenAI: could not extract text from response: {e}") from e
 
-    text = str(text).strip()
-    m = re.search(r"\d+", text)
-    if not m:
-        raise RuntimeError(f"OpenAI: output did not contain an integer score: {text!r}")
-
-    score = int(m.group())
-    return max(0, min(100, score))
+    return parse_score_feedback(str(text))
 
 
 def grade_answer_gemini_http(
+    question: str,
     user: str,
     correct: str,
     api_key: str,
@@ -322,22 +360,25 @@ def grade_answer_gemini_http(
     api_url_tpl: str,
     timeout_sec: int,
     max_output_tokens: int,
-) -> int:
+) -> Tuple[int, str]:
     key = api_key or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     if not key:
         raise RuntimeError("Gemini API key is not set (gemini_api_key / GEMINI_API_KEY / GOOGLE_API_KEY).")
 
     prompt = (
-        "Rate how similar the student answer is to the model answer.\n"
-        "Return a number 0-100 only.\n\n"
-        f"Model: {correct}\n"
-        f"Student: {user}\n"
+        "You are grading a student's typed answer in Anki.\n"
+        "Use the QUESTION to judge whether the student's answer satisfies what is asked.\n"
+        "Be strict about constraints (e.g., negation, numbers of items, specific terms).\n"
+        "Return exactly two lines:\n"
+        "Score: <0-100>\n"
+        "Feedback: <one short sentence about the main difference>\n\n"
+        f"Question: {question}\n"
+        f"Model Answer: {correct}\n"
+        f"Student Answer: {user}\n"
     )
 
     api_url = api_url_tpl.format(model=model)
-
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_output_tokens, "temperature": 0},
@@ -387,7 +428,6 @@ def grade_answer_gemini_http(
                         if got:
                             return got
                 return None
-
             text = _walk(j)
 
         if text is None:
@@ -396,22 +436,31 @@ def grade_answer_gemini_http(
     except Exception as e:
         raise RuntimeError(f"Gemini: could not extract text from response: {e}") from e
 
-    text = str(text).strip()
-    m = re.search(r"\d+", text)
-    if not m:
-        raise RuntimeError(f"Gemini: output did not contain an integer score: {text!r}")
-
-    score = int(m.group())
-    return max(0, min(100, score))
+    return parse_score_feedback(str(text))
 
 
-def grade_answer_local(user: str, correct: str) -> int:
+def grade_answer_local(_question: str, user: str, correct: str) -> Tuple[int, str]:
     if not user and not correct:
-        return 100
-    if not user or not correct:
-        return 0
+        return 100, "Perfect."
+    if not user and correct:
+        return 0, "No answer was entered."
+    if user and not correct:
+        return 0, "No model answer found."
+
     ratio = SequenceMatcher(None, user.strip(), correct.strip()).ratio()
-    return int(ratio * 100)
+    score = int(ratio * 100)
+
+    if score >= 90:
+        fb = "Almost identical to the model answer."
+    elif score >= 75:
+        fb = "Main idea is correct; improve precision or missing details."
+    elif score >= 55:
+        fb = "Partially correct; key details are missing or unclear."
+    elif score >= 35:
+        fb = "Some overlap, but important points do not match the expected answer."
+    else:
+        fb = "Does not match the expected answer."
+    return score, fb
 
 
 def score_to_ease(score: int, cfg: Dict[str, Any]) -> int:
@@ -433,11 +482,18 @@ def _provider_candidates(cfg: Dict[str, Any]) -> List[str]:
     return list(cfg.get("provider_auto_order", ["openai", "gemini"]))
 
 
-def _background_grade(typed: str, correct: str, cfg: Dict[str, Any]) -> Tuple[int, str, Optional[str]]:
+def _background_grade(
+    question: str,
+    typed: str,
+    correct: str,
+    cfg: Dict[str, Any],
+) -> Tuple[int, str, str, Optional[str]]:
     score: Optional[int] = None
+    feedback: str = ""
     source = "local"
     error_message: Optional[str] = None
 
+    q_n = _clip(normalize_text(question), int(cfg.get("max_question_chars", 1200)))
     typed_n = normalize_text(typed)
     correct_n = normalize_text(correct)
 
@@ -446,8 +502,8 @@ def _background_grade(typed: str, correct: str, cfg: Dict[str, Any]) -> Tuple[in
             if provider == "openai":
                 if not (cfg.get("openai_api_key") or os.getenv("OPENAI_API_KEY", "")):
                     continue
-                score = grade_answer_openai_http(
-                    typed_n, correct_n,
+                score, feedback = grade_answer_openai_http(
+                    q_n, typed_n, correct_n,
                     cfg["openai_api_key"],
                     cfg["openai_model"],
                     cfg["openai_api_url"],
@@ -461,8 +517,8 @@ def _background_grade(typed: str, correct: str, cfg: Dict[str, Any]) -> Tuple[in
             if provider == "gemini":
                 if not (cfg.get("gemini_api_key") or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")):
                     continue
-                score = grade_answer_gemini_http(
-                    typed_n, correct_n,
+                score, feedback = grade_answer_gemini_http(
+                    q_n, typed_n, correct_n,
                     cfg["gemini_api_key"],
                     cfg["gemini_model"],
                     cfg["gemini_api_url"],
@@ -479,14 +535,15 @@ def _background_grade(typed: str, correct: str, cfg: Dict[str, Any]) -> Tuple[in
                 break
 
     if score is None:
-        score = grade_answer_local(typed_n, correct_n)
+        score, feedback = grade_answer_local(q_n, typed_n, correct_n)
         source = "local (AI error)" if error_message else "local"
 
-    return score, source, error_message
+    feedback = _clip((feedback or "").strip(), int(cfg.get("feedback_max_chars", 180)))
+    return int(score), feedback, source, error_message
 
 
 # =============================================================================
-# UI: score badge
+# UI
 # =============================================================================
 
 def _ensure_score_css(reviewer: Reviewer) -> None:
@@ -508,6 +565,14 @@ def _ensure_score_css(reviewer: Reviewer) -> None:
             font-weight: 700;
             font-size: 1.0em;
             display: inline-block;
+        }
+        #ai-feedback {
+            margin: 8px auto 0;
+            max-width: 820px;
+            font-size: 0.95em;
+            line-height: 1.35;
+            opacity: 0.92;
+            text-align: center;
         }
         .ai-pending {
             color: #555555;
@@ -560,13 +625,16 @@ def show_pending_on_card(reviewer: Reviewer) -> None:
         }
         el.className = 'ai-pending';
         el.textContent = '⚙ AI grading…';
+
+        var fb = document.getElementById('ai-feedback');
+        if (fb) fb.textContent = '';
         wrapper.style.display = 'block';
     })();
     """
     reviewer.web.eval(js)
 
 
-def show_score_on_card(reviewer: Reviewer, score: int, cfg: Dict[str, Any]) -> None:
+def show_score_on_card(reviewer: Reviewer, score: int, feedback: str, cfg: Dict[str, Any]) -> None:
     if score >= cfg["easy_min"]:
         cls = "ai-easy"
     elif score >= cfg["good_min"]:
@@ -577,6 +645,25 @@ def show_score_on_card(reviewer: Reviewer, score: int, cfg: Dict[str, Any]) -> N
         cls = "ai-again"
 
     _ensure_score_css(reviewer)
+
+    show_fb = bool(cfg.get("show_feedback_on_card", False))
+    fb_js = ""
+    if show_fb and feedback:
+        safe_fb = json.dumps(f"💡 {feedback}")
+        fb_js = f"""
+        var fb = document.getElementById('ai-feedback');
+        if (!fb) {{
+            fb = document.createElement('div');
+            fb.id = 'ai-feedback';
+            wrapper.appendChild(fb);
+        }}
+        fb.textContent = {safe_fb};
+        """
+    else:
+        fb_js = """
+        var fb = document.getElementById('ai-feedback');
+        if (fb) fb.textContent = '';
+        """
 
     js = f"""
     (function(){{
@@ -594,6 +681,7 @@ def show_score_on_card(reviewer: Reviewer, score: int, cfg: Dict[str, Any]) -> N
         }}
         el.className = '{cls}';
         el.textContent = 'Score: {score}%';
+        {fb_js}
         wrapper.style.display = 'block';
     }})();
     """
@@ -615,21 +703,24 @@ def hide_score_on_card(reviewer: Reviewer) -> None:
 # =============================================================================
 
 def on_reviewer_did_show_answer(card: Card) -> None:
-    global last_ai_ease
+    global last_ai_ease, last_ai_feedback
 
     cfg = get_config()
     if not cfg["enabled"]:
         last_ai_ease = None
+        last_ai_feedback = None
         return
 
     reviewer = mw.reviewer
     if reviewer is None:
         last_ai_ease = None
+        last_ai_feedback = None
         return
 
     typed = getattr(reviewer, "typedAnswer", None)
     if not typed or not str(typed).strip():
         last_ai_ease = None
+        last_ai_feedback = None
         hide_score_on_card(reviewer)
         return
 
@@ -639,28 +730,36 @@ def on_reviewer_did_show_answer(card: Card) -> None:
         if cfg["show_tooltip"]:
             tooltip(f"AI grading: field '{answer_field}' not found.")
         last_ai_ease = None
+        last_ai_feedback = None
         hide_score_on_card(reviewer)
         return
 
     correct = note[answer_field]
     card_id = card.id
 
+    try:
+        q_html = card.question()
+    except Exception:
+        q_html = ""
+    question = q_html or ""
+
     if cfg["show_on_card"]:
         show_pending_on_card(reviewer)
 
-    def _do_in_background() -> Tuple[int, str, Optional[str]]:
-        return _background_grade(str(typed), str(correct), cfg)
+    def _do_in_background() -> Tuple[int, str, str, Optional[str]]:
+        return _background_grade(str(question), str(typed), str(correct), cfg)
 
     def _on_done(future) -> None:
-        global last_ai_ease
+        global last_ai_ease, last_ai_feedback
 
         try:
-            score, source, error_message = future.result()
+            score, feedback, source, error_message = future.result()
         except Exception as e:
             cfg_local = get_config()
             if cfg_local.get("show_tooltip", True):
                 tooltip(f"AI grading error: {e}")
             last_ai_ease = None
+            last_ai_feedback = None
             reviewer_now = mw.reviewer
             if reviewer_now is not None:
                 hide_score_on_card(reviewer_now)
@@ -675,29 +774,33 @@ def on_reviewer_did_show_answer(card: Card) -> None:
         cfg_local = get_config()
         if not cfg_local["enabled"]:
             last_ai_ease = None
+            last_ai_feedback = None
             hide_score_on_card(reviewer_now)
             return
 
         if cfg_local["show_tooltip"]:
+            fb_part = f"\nFeedback: {feedback}" if feedback else ""
             if error_message and source.startswith("local"):
                 msg = error_message
-                if len(msg) > 300:
-                    msg = msg[:300] + "…"
-                tooltip(f"{source}: {score}% ({msg})")
+                if len(msg) > 240:
+                    msg = msg[:240] + "…"
+                tooltip(f"{source}: {score}%{fb_part}\n({msg})")
             else:
-                tooltip(f"{source} score: {score}%")
+                tooltip(f"{source} score: {score}%{fb_part}")
 
         if cfg_local["show_on_card"]:
-            show_score_on_card(reviewer_now, score, cfg_local)
+            show_score_on_card(reviewer_now, score, feedback, cfg_local)
 
         last_ai_ease = score_to_ease(score, cfg_local)
+        last_ai_feedback = feedback or None
 
     mw.taskman.run_in_background(_do_in_background, _on_done)
 
 
 def on_reviewer_did_show_question(card: Card) -> None:
-    global last_ai_ease
+    global last_ai_ease, last_ai_feedback
     last_ai_ease = None
+    last_ai_feedback = None
     reviewer = mw.reviewer
     if reviewer is not None:
         hide_score_on_card(reviewer)
@@ -733,7 +836,7 @@ Reviewer._defaultEase = _ai_default_ease
 
 
 # =============================================================================
-# Config Dialog (opened from Tools -> Add-ons -> Config)
+# Config Dialog
 # =============================================================================
 
 _DEFAULT_NUMBERED_CONFIG: Dict[str, Any] = {
@@ -752,14 +855,16 @@ _DEFAULT_NUMBERED_CONFIG: Dict[str, Any] = {
     "33. hard_min": 40,
     "40. show_tooltip": True,
     "41. show_on_card": True,
+    "42. show_feedback_on_card": False,
     "50. auto_answer": True,
     "60. timeout_sec": 20,
-    "61. max_output_tokens": 16,
+    "61. max_output_tokens": 64,
+    "62. max_question_chars": 1200,
+    "63. feedback_max_chars": 180,
 }
 
 
 def _to_numbered_config(cfg_plain: Dict[str, Any]) -> Dict[str, Any]:
-    """Internal plain keys -> numbered keys (keeps ordering stable)."""
     return {
         "01. enabled": bool(cfg_plain.get("enabled", True)),
         "02. provider": str(cfg_plain.get("provider", "auto")),
@@ -783,11 +888,14 @@ def _to_numbered_config(cfg_plain: Dict[str, Any]) -> Dict[str, Any]:
 
         "40. show_tooltip": bool(cfg_plain.get("show_tooltip", True)),
         "41. show_on_card": bool(cfg_plain.get("show_on_card", True)),
+        "42. show_feedback_on_card": bool(cfg_plain.get("show_feedback_on_card", False)),
 
         "50. auto_answer": bool(cfg_plain.get("auto_answer", True)),
 
         "60. timeout_sec": int(cfg_plain.get("timeout_sec", 20)),
-        "61. max_output_tokens": int(cfg_plain.get("max_output_tokens", 16)),
+        "61. max_output_tokens": int(cfg_plain.get("max_output_tokens", 64)),
+        "62. max_question_chars": int(cfg_plain.get("max_question_chars", 1200)),
+        "63. feedback_max_chars": int(cfg_plain.get("feedback_max_chars", 180)),
     }
 
 
@@ -797,19 +905,17 @@ class AiTypeGraderConfigDialog(QDialog):
         self.setWindowTitle("AI Type Grader - Settings")
         self.setMinimumWidth(560)
 
-        # always read fresh
         _invalidate_config_cache()
         cfg = get_config()
 
         root = QVBoxLayout(self)
-
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
         self.setSizeGripEnabled(True)
 
         info = QLabel(
             "Configure provider, scoring thresholds, and UI.\n"
-            "API keys are stored in Anki's add-on config (meta.json)."
+            "Uses Question text for stricter grading and returns score + feedback."
         )
         info.setWordWrap(True)
         root.addWidget(info)
@@ -817,12 +923,11 @@ class AiTypeGraderConfigDialog(QDialog):
         tabs = QTabWidget(self)
         root.addWidget(tabs)
 
-        # ---- Tab: General
+        # ---- General
         tab_general = QWidget()
         tabs.addTab(tab_general, "General")
         gl = QVBoxLayout(tab_general)
 
-        # ---- General (top form) : QWidgetで包んで「縦に伸びすぎ」を防ぐ
         general_top = QWidget()
         general_top.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         form_g = QFormLayout(general_top)
@@ -842,7 +947,6 @@ class AiTypeGraderConfigDialog(QDialog):
         self.provider_combo.setMinimumWidth(220)
         form_g.addRow("Provider", self.provider_combo)
 
-        # ---- Auto order box
         auto_box = QGroupBox("Auto provider order (when Provider = auto)")
         auto_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         auto_form = QFormLayout(auto_box)
@@ -874,7 +978,7 @@ class AiTypeGraderConfigDialog(QDialog):
         gl.addWidget(auto_box)
         gl.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # ---- Tab: OpenAI
+        # ---- OpenAI
         tab_openai = QWidget()
         tabs.addTab(tab_openai, "OpenAI")
         ol = QVBoxLayout(tab_openai)
@@ -882,7 +986,6 @@ class AiTypeGraderConfigDialog(QDialog):
 
         openai_box = QGroupBox("OpenAI settings")
         openai_form = QFormLayout(openai_box)
-
         openai_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         openai_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         openai_form.setHorizontalSpacing(12)
@@ -890,16 +993,12 @@ class AiTypeGraderConfigDialog(QDialog):
 
         self.openai_key = QLineEdit()
         self.openai_key.setEchoMode(QLineEdit.EchoMode.Password)
-
-        # ★ 追記：cfg反映＋見た目（Geminiと揃える）
         self.openai_key.setText(str(cfg.get("openai_api_key", "")))
         self.openai_key.setMinimumWidth(360)
         self.openai_key.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self.openai_key_toggle = QPushButton("Show")
         self.openai_key_toggle.setFixedWidth(80)
-
-        # ★ 追記：Show/Hide を動かす
         self.openai_key_toggle.clicked.connect(self._toggle_openai_key)
 
         key_w = QWidget()
@@ -908,20 +1007,17 @@ class AiTypeGraderConfigDialog(QDialog):
         key_l.setSpacing(8)
         key_l.addWidget(self.openai_key, 1)
         key_l.addWidget(self.openai_key_toggle, 0)
-
         openai_form.addRow("API key", key_w)
 
         self.openai_model = QLineEdit(str(cfg.get("openai_model", "gpt-4o-mini")))
-        self.openai_model.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         openai_form.addRow("Model", self.openai_model)
 
         self.openai_url = QLineEdit(str(cfg.get("openai_api_url", "https://api.openai.com/v1/responses")))
-        self.openai_url.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         openai_form.addRow("API URL", self.openai_url)
 
         ol.addWidget(openai_box)
 
-        # ---- Tab: Gemini
+        # ---- Gemini
         tab_gemini = QWidget()
         tabs.addTab(tab_gemini, "Gemini")
         ml = QVBoxLayout(tab_gemini)
@@ -929,7 +1025,6 @@ class AiTypeGraderConfigDialog(QDialog):
 
         gemini_box = QGroupBox("Gemini settings")
         gemini_form = QFormLayout(gemini_box)
-
         gemini_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         gemini_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         gemini_form.setHorizontalSpacing(12)
@@ -951,23 +1046,20 @@ class AiTypeGraderConfigDialog(QDialog):
         gkey_l.setSpacing(8)
         gkey_l.addWidget(self.gemini_key, 1)
         gkey_l.addWidget(self.gemini_key_toggle, 0)
-
         gemini_form.addRow("API key", gkey_w)
 
         self.gemini_model = QLineEdit(str(cfg.get("gemini_model", "gemini-2.5-flash-lite")))
-        self.gemini_model.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         gemini_form.addRow("Model", self.gemini_model)
 
         self.gemini_url = QLineEdit(str(cfg.get(
             "gemini_api_url",
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         )))
-        self.gemini_url.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         gemini_form.addRow("API URL", self.gemini_url)
 
         ml.addWidget(gemini_box)
 
-        # ---- Tab: Scoring & UI
+        # ---- Scoring & UI
         tab_scoring = QWidget()
         tabs.addTab(tab_scoring, "Scoring & UI")
         sl = QVBoxLayout(tab_scoring)
@@ -999,13 +1091,17 @@ class AiTypeGraderConfigDialog(QDialog):
         ui_box = QGroupBox("UI / Behavior")
         ui_form = QFormLayout(ui_box)
 
-        self.show_tooltip = QCheckBox("Show tooltip")
+        self.show_tooltip = QCheckBox("Show tooltip (score + feedback)")
         self.show_tooltip.setChecked(bool(cfg.get("show_tooltip", True)))
         ui_form.addRow(self.show_tooltip)
 
-        self.show_on_card = QCheckBox("Show badge on card back")
+        self.show_on_card = QCheckBox("Show badge on card back (score)")
         self.show_on_card.setChecked(bool(cfg.get("show_on_card", True)))
         ui_form.addRow(self.show_on_card)
+
+        self.show_feedback_on_card = QCheckBox("Show feedback line on card back")
+        self.show_feedback_on_card.setChecked(bool(cfg.get("show_feedback_on_card", False)))
+        ui_form.addRow(self.show_feedback_on_card)
 
         self.auto_answer = QCheckBox("Override Enter/Space answer button automatically")
         self.auto_answer.setChecked(bool(cfg.get("auto_answer", True)))
@@ -1013,7 +1109,7 @@ class AiTypeGraderConfigDialog(QDialog):
 
         sl.addWidget(ui_box)
 
-        net_box = QGroupBox("Networking")
+        net_box = QGroupBox("Networking / Limits")
         net_form = QFormLayout(net_box)
 
         self.timeout_sec = QSpinBox()
@@ -1023,12 +1119,21 @@ class AiTypeGraderConfigDialog(QDialog):
 
         self.max_output_tokens = QSpinBox()
         self.max_output_tokens.setRange(1, 4096)
-        self.max_output_tokens.setValue(int(cfg.get("max_output_tokens", 16)))
+        self.max_output_tokens.setValue(int(cfg.get("max_output_tokens", 64)))
         net_form.addRow("Max output tokens", self.max_output_tokens)
+
+        self.max_question_chars = QSpinBox()
+        self.max_question_chars.setRange(0, 20000)
+        self.max_question_chars.setValue(int(cfg.get("max_question_chars", 1200)))
+        net_form.addRow("Max question chars (0=off)", self.max_question_chars)
+
+        self.feedback_max_chars = QSpinBox()
+        self.feedback_max_chars.setRange(0, 2000)
+        self.feedback_max_chars.setValue(int(cfg.get("feedback_max_chars", 180)))
+        net_form.addRow("Max feedback chars (0=off)", self.feedback_max_chars)
 
         sl.addWidget(net_box)
 
-        # ---- Buttons
         btn_row = QHBoxLayout()
         root.addLayout(btn_row)
 
@@ -1038,9 +1143,7 @@ class AiTypeGraderConfigDialog(QDialog):
 
         btn_row.addStretch(1)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -1073,44 +1176,43 @@ class AiTypeGraderConfigDialog(QDialog):
     def _reset_to_defaults(self) -> None:
         d = dict(_DEFAULT_NUMBERED_CONFIG)
 
-        # General
         self.enabled_cb.setChecked(bool(d["01. enabled"]))
         self.provider_combo.setCurrentText(str(d["02. provider"]))
         order = list(d["03. provider_auto_order"])
         self.auto_first.setCurrentText(order[0])
         self.auto_second.setCurrentText(order[1])
 
-        # OpenAI
         self.openai_key.setText(str(d["10. openai_api_key"]))
         self.openai_model.setText(str(d["11. openai_model"]))
         self.openai_url.setText(str(d["12. openai_api_url"]))
 
-        # Gemini
         self.gemini_key.setText(str(d["20. gemini_api_key"]))
         self.gemini_model.setText(str(d["21. gemini_model"]))
         self.gemini_url.setText(str(d["22. gemini_api_url"]))
 
-        # Scoring/UI/Net
         self.answer_field.setText(str(d["30. answer_field"]))
         self.easy_min.setValue(int(d["31. easy_min"]))
         self.good_min.setValue(int(d["32. good_min"]))
         self.hard_min.setValue(int(d["33. hard_min"]))
+
         self.show_tooltip.setChecked(bool(d["40. show_tooltip"]))
         self.show_on_card.setChecked(bool(d["41. show_on_card"]))
+        self.show_feedback_on_card.setChecked(bool(d["42. show_feedback_on_card"]))
         self.auto_answer.setChecked(bool(d["50. auto_answer"]))
+
         self.timeout_sec.setValue(int(d["60. timeout_sec"]))
         self.max_output_tokens.setValue(int(d["61. max_output_tokens"]))
+        self.max_question_chars.setValue(int(d["62. max_question_chars"]))
+        self.feedback_max_chars.setValue(int(d["63. feedback_max_chars"]))
 
         self._refresh_enabled_state()
 
     def accept(self) -> None:
-        # Build plain cfg (same as get_config() returns)
         provider = self.provider_combo.currentText().strip().lower()
 
         first = self.auto_first.currentText().strip().lower()
         second = self.auto_second.currentText().strip().lower()
         if first == second:
-            # deterministic fix
             second = "gemini" if first == "openai" else "openai"
 
         plain: Dict[str, Any] = {
@@ -1134,20 +1236,19 @@ class AiTypeGraderConfigDialog(QDialog):
 
             "show_tooltip": self.show_tooltip.isChecked(),
             "show_on_card": self.show_on_card.isChecked(),
+            "show_feedback_on_card": self.show_feedback_on_card.isChecked(),
+
             "auto_answer": self.auto_answer.isChecked(),
 
             "timeout_sec": int(self.timeout_sec.value()),
             "max_output_tokens": int(self.max_output_tokens.value()),
+            "max_question_chars": int(self.max_question_chars.value()),
+            "feedback_max_chars": int(self.feedback_max_chars.value()),
         }
 
-        # Basic sanity (keep thresholds ordered if user messed them up)
-        # easy >= good >= hard
-        e = plain["easy_min"]
-        g = plain["good_min"]
-        h = plain["hard_min"]
-        e = max(0, min(100, e))
-        g = max(0, min(100, g))
-        h = max(0, min(100, h))
+        e = max(0, min(100, int(plain["easy_min"])))
+        g = max(0, min(100, int(plain["good_min"])))
+        h = max(0, min(100, int(plain["hard_min"])))
         if e < g:
             e = g
         if g < h:
@@ -1162,17 +1263,13 @@ class AiTypeGraderConfigDialog(QDialog):
 
 
 def _open_config_dialog(*args, **kwargs) -> None:
-    # Anki may pass a parent dialog/window; fall back to mw
-    parent = None
-    if args:
-        parent = args[0]
+    parent = args[0] if args else None
     if parent is None:
         parent = mw
     dlg = AiTypeGraderConfigDialog(parent)
     dlg.exec()
 
 
-# Register: make Add-ons -> Config open our dialog (no Tools menu button needed)
 try:
     mw.addonManager.setConfigAction(__name__, _open_config_dialog)  # type: ignore[attr-defined]
 except Exception:
